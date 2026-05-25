@@ -1,0 +1,5 @@
+numpy
+pennylane
+tradingview-ta
+pandas
+tradingview-screener
