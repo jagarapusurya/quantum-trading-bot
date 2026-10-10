@@ -1,7 +1,8 @@
 import time
 import numpy as np
-import pennylane as qml
-from pennylane import numpy as pnp
+from qiskit import QuantumCircuit
+from qiskit.circuit import ParameterVector
+from qiskit.quantum_info import Statevector, SparsePauliOp
 from tradingview_ta import TA_Handler, Interval
 
 # TradingView Setup
@@ -47,26 +48,42 @@ for i in range(len(features_norm) - 1):
 X_data = np.array(X_data)
 Y_data = np.array(Y_data)
 
-# Quantum Neural Network
-dev = qml.device("default.qubit", wires=n_qubits)
+# Quantum Neural Network (Qiskit)
+depth = 3
+def q(wire):
+    return n_qubits - 1 - wire
 
-def variational_block(weights):
+def variational_block(circuit, weights):
     for layer in weights:
         for i in range(n_qubits):
-            qml.RY(layer[i], wires=i)
+            circuit.ry(layer[i], q(i))
         for i in range(n_qubits - 1):
-            qml.CNOT(wires=[i, i + 1])
-        qml.CNOT(wires=[n_qubits - 1, 0])
+            circuit.cx(q(i), q(i + 1))
+        circuit.cx(q(n_qubits - 1), q(0))
 
-@qml.qnode(dev)
+# Parametrised ansatz is built once, then parameters are bound per call
+theta = ParameterVector("w", depth * n_qubits)
+ansatz = QuantumCircuit(n_qubits)
+variational_block(ansatz, np.array(theta, dtype=object).reshape(depth, n_qubits))
+
+observable = SparsePauliOp("".join("Z" if k == q(0) else "I" for k in reversed(range(n_qubits))))
+
 def qnn(features, weights):
-    qml.AmplitudeEmbedding(features, wires=range(n_qubits), normalize=True)
-    variational_block(weights)
-    return qml.expval(qml.PauliZ(0))
+    # Amplitude embedding (normalised)
+    features = np.asarray(features, dtype=complex)
+    features = features / np.linalg.norm(features)
+    state = Statevector(features)
+
+    # Variational block
+    bound = ansatz.assign_parameters(np.asarray(weights).flatten())
+    state = state.evolve(bound)
+
+    # Expectation value of PauliZ on the first wire
+    return float(np.real(state.expectation_value(observable)))
 
 def binary_cross_entropy(pred, label):
-    pred = pnp.clip(pred, 1e-6, 1 - 1e-6)
-    return -label * pnp.log(pred) - (1 - label) * pnp.log(1 - pred)
+    pred = np.clip(pred, 1e-6, 1 - 1e-6)
+    return -label * np.log(pred) - (1 - label) * np.log(1 - pred)
 
 def cost(weights, X, Y):
     loss = 0
@@ -75,13 +92,48 @@ def cost(weights, X, Y):
         loss += binary_cross_entropy(pred, y)
     return loss / len(Y)
 
+# Gradient via the parameter-shift rule (exact for RY rotations)
+def cost_grad(weights, X, Y):
+    flat = np.asarray(weights).flatten()
+    grad = np.zeros_like(flat)
+    shift = np.pi / 2
+    for k in range(len(flat)):
+        plus, minus = flat.copy(), flat.copy()
+        plus[k] += shift
+        minus[k] -= shift
+        g = 0
+        for x, y in zip(X, Y):
+            e = qnn(x, flat.reshape(weights.shape))
+            p = (e + 1) / 2
+            de = (qnn(x, plus.reshape(weights.shape)) - qnn(x, minus.reshape(weights.shape))) / 2
+            if 1e-6 < p < 1 - 1e-6:  # clip has zero gradient outside this range
+                dloss_dp = -y / p + (1 - y) / (1 - p)
+                g += dloss_dp * 0.5 * de
+        grad[k] = g / len(Y)
+    return grad.reshape(weights.shape)
+
+class AdamOptimizer:
+    def __init__(self, stepsize=0.01, beta1=0.9, beta2=0.999, eps=1e-8):
+        self.stepsize, self.beta1, self.beta2, self.eps = stepsize, beta1, beta2, eps
+        self.m = self.v = None
+        self.t = 0
+
+    def step(self, grad_fn, weights):
+        g = grad_fn(weights)
+        self.t += 1
+        if self.m is None:
+            self.m, self.v = np.zeros_like(weights), np.zeros_like(weights)
+        self.m = self.beta1 * self.m + (1 - self.beta1) * g
+        self.v = self.beta2 * self.v + (1 - self.beta2) * g * g
+        a = self.stepsize * np.sqrt(1 - self.beta2 ** self.t) / (1 - self.beta1 ** self.t)
+        return weights - a * self.m / (np.sqrt(self.v) + self.eps)
+
 # Training
-depth = 3
-weights = pnp.random.normal(0, np.pi, (depth, n_qubits), requires_grad=True)
-opt = qml.AdamOptimizer(stepsize=0.1)
+weights = np.random.normal(0, np.pi, (depth, n_qubits))
+opt = AdamOptimizer(stepsize=0.1)
 
 for epoch in range(25):
-    weights = opt.step(lambda w: cost(w, X_data, Y_data), weights)
+    weights = opt.step(lambda w: cost_grad(w, X_data, Y_data), weights)
     if epoch % 5 == 0:
         print(f"Epoch {epoch}, Loss: {cost(weights, X_data, Y_data):.4f}")
 
